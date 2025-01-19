@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
-from PyPDF2 import PdfReader
+from PyPDF2 import PdfReader, PdfWriter
 import re
 import io
+import zipfile
 from datetime import datetime
 
 class ExpenseData:
@@ -77,9 +78,35 @@ def extract_expense_data(text, max_pages_to_search=2):
     
     return data
 
+def split_pdf_to_pages(pdf_reader):
+    """Split PDF into individual pages and return a dict of BytesIO objects"""
+    pages = {}
+    for page_num in range(len(pdf_reader.pages)):
+        pdf_writer = PdfWriter()
+        pdf_writer.add_page(pdf_reader.pages[page_num])
+        page_buffer = io.BytesIO()
+        pdf_writer.write(page_buffer)
+        page_buffer.seek(0)
+        pages[f'page_{page_num + 1}'] = page_buffer
+    return pages
+
+def create_zip_of_pdfs(pdf_pages_dict, original_filename):
+    """Create a zip file containing individual PDF pages"""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        base_filename = original_filename.rsplit('.', 1)[0]
+        for page_num, page_buffer in pdf_pages_dict.items():
+            zf.writestr(
+                f"{base_filename}/{page_num}.pdf",
+                page_buffer.getvalue()
+            )
+    zip_buffer.seek(0)
+    return zip_buffer
+
 def process_pdfs(uploaded_files):
     """Process uploaded PDF files and extract expense data"""
     processed_data = []
+    all_pdf_pages = {}
     
     for uploaded_file in uploaded_files:
         try:
@@ -95,6 +122,10 @@ def process_pdfs(uploaded_files):
             expense_data = extract_expense_data(summary_text)
             expense_data.file_name = uploaded_file.name
             
+            # Split PDF into pages
+            pdf_pages = split_pdf_to_pages(pdf_reader)
+            all_pdf_pages[uploaded_file.name] = pdf_pages
+            
             # Add to processed data
             processed_data.append({
                 'File Name': expense_data.file_name,
@@ -108,7 +139,7 @@ def process_pdfs(uploaded_files):
         except Exception as e:
             st.error(f"Error processing {uploaded_file.name}: {str(e)}")
     
-    return processed_data
+    return processed_data, all_pdf_pages
 
 def main():
     st.set_page_config(page_title="PDF Expense Report Processor", layout="wide")
@@ -118,8 +149,8 @@ def main():
     st.write("""
     ### Instructions
     1. Upload one or more PDF expense reports
-    2. The app will extract key information
-    3. Download the results as an Excel file
+    2. The app will extract key information and split the PDFs into pages
+    3. Download the Excel summary and/or individual processed PDFs
     """)
     
     uploaded_files = st.file_uploader(
@@ -131,7 +162,7 @@ def main():
     
     if uploaded_files:
         with st.spinner('Processing PDFs...'):
-            processed_data = process_pdfs(uploaded_files)
+            processed_data, all_pdf_pages = process_pdfs(uploaded_files)
             
             if processed_data:
                 df = pd.DataFrame(processed_data)
@@ -140,45 +171,58 @@ def main():
                 st.subheader("Extracted Data")
                 st.dataframe(df)
                 
-                # Create download button for Excel
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    df.to_excel(writer, sheet_name='Expense Data', index=False)
-                    
-                    # Get the xlsxwriter workbook and worksheet objects
-                    workbook = writer.book
-                    worksheet = writer.sheets['Expense Data']
-                    
-                    # Add formatting
-                    header_format = workbook.add_format({
-                        'bold': True,
-                        'text_wrap': True,
-                        'valign': 'top',
-                        'bg_color': '#D9D9D9',
-                        'border': 1
-                    })
-                    
-                    # Write headers with format
-                    for col_num, value in enumerate(df.columns.values):
-                        worksheet.write(0, col_num, value, header_format)
-                    
-                    # Auto-adjust columns
-                    for idx, col in enumerate(df.columns):
-                        series = df[col]
-                        max_len = max(
-                            series.astype(str).map(len).max(),
-                            len(str(series.name))
-                        ) + 2
-                        worksheet.set_column(idx, idx, max_len)
+                # Create columns for download buttons
+                col1, col2 = st.columns(2)
                 
-                buffer.seek(0)
+                # Excel download button
+                with col1:
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                        df.to_excel(writer, sheet_name='Expense Data', index=False)
+                        workbook = writer.book
+                        worksheet = writer.sheets['Expense Data']
+                        
+                        header_format = workbook.add_format({
+                            'bold': True,
+                            'text_wrap': True,
+                            'valign': 'top',
+                            'bg_color': '#D9D9D9',
+                            'border': 1
+                        })
+                        
+                        for col_num, value in enumerate(df.columns.values):
+                            worksheet.write(0, col_num, value, header_format)
+                        
+                        for idx, col in enumerate(df.columns):
+                            series = df[col]
+                            max_len = max(
+                                series.astype(str).map(len).max(),
+                                len(str(series.name))
+                            ) + 2
+                            worksheet.set_column(idx, idx, max_len)
+                    
+                    buffer.seek(0)
+                    st.download_button(
+                        label="📊 Download Excel Summary",
+                        data=buffer,
+                        file_name=f"expense_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.ms-excel"
+                    )
                 
-                st.download_button(
-                    label="Download Excel file",
-                    data=buffer,
-                    file_name=f"expense_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.ms-excel"
-                )
+                # PDF downloads
+                with col2:
+                    # Create a zip file containing all PDFs
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    
+                    for original_filename, pdf_pages in all_pdf_pages.items():
+                        zip_buffer = create_zip_of_pdfs(pdf_pages, original_filename)
+                        
+                        st.download_button(
+                            label=f"📄 Download {original_filename} (Split Pages)",
+                            data=zip_buffer,
+                            file_name=f"{original_filename.rsplit('.', 1)[0]}_{timestamp}_pages.zip",
+                            mime="application/zip"
+                        )
                 
                 st.success(f"Successfully processed {len(processed_data)} files!")
             else:
